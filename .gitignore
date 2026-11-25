@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+client.json
+client_secret*.json
+token.json
+upload-state.json
+downloads/
+build/
+dist/
+*.spec
+config.json

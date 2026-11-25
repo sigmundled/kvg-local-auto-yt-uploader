@@ -1,0 +1,29 @@
+# Changelog
+
+All notable changes to Auto YouTube Uploader are listed here, newest first.
+
+## 1.3.0
+
+- Client is now packaged as a folder (`AutoYouTubeUploader\` with `AutoYouTubeUploader.exe`
+  and `_internal`) instead of a single file, so it starts faster.
+- Updates are delivered as a ZIP of that folder. The update replaces program files and keeps
+  `config.json` and per-user data.
+- Default update source is the GitHub Releases `latest.json`, so no URL needs to be typed.
+- Build can code-sign the EXE with `AUTOYT_SIGN_PFX` (Windows SmartScreen guidance in README).
+
+## 1.2.0
+
+- Settings are stored in `config.json` beside the app, so setup is not repeated on each launch.
+- New modern client window (customtkinter) replaces the old Tk window. It shows status, a
+  "Check now" button, pause, a countdown to the next check, progress, and the upload link.
+- Launching with no arguments opens the client. Passing arguments runs the command-line tool.
+- First-run Welcome dialog is shown on the visible window, so it no longer opens hidden.
+- Added this Changelog view.
+- Build bundles `customtkinter` and this changelog.
+
+## 1.1.0
+
+- Hourly automatic check for the latest request row with a blank YouTube Link.
+- Update checks against an HTTPS manifest with SHA-256 verification.
+- Version is shown in the window title and status.
+- Packaged as a Windows EXE with first-run setup, so colleagues do not need Python.
