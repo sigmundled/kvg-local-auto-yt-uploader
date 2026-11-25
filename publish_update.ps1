@@ -48,7 +48,7 @@ try {
     if (git status --porcelain) {
         throw "Working tree has uncommitted changes. Commit and push before publishing."
     }
-    if (git rev-parse -q --verify "refs/tags/$Tag") {
+    if (-not $DryRun -and (git rev-parse -q --verify "refs/tags/$Tag")) {
         throw "Tag $Tag already exists. Bump APP_VERSION in auto_yt.py and rebuild."
     }
     if (-not (git branch --remotes --contains HEAD)) {
