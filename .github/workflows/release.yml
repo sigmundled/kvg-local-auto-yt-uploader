@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-attach:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      RELEASE_NOTES: ${{ github.event.release.body }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+      - name: Check release tag matches APP_VERSION
+        shell: pwsh
+        run: |
+          $source = Get-Content -LiteralPath auto_yt.py -Raw
+          if ($source -notmatch 'APP_VERSION = "([^"]+)"') { throw "APP_VERSION not found in auto_yt.py" }
+          $version = $Matches[1]
+          if ($env:TAG -ne "v$version") { throw "Release tag $env:TAG does not match APP_VERSION $version." }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build application folder
+        run: >
+          python -m PyInstaller --noconfirm --clean --onedir --windowed
+          --name AutoYouTubeUploader
+          --collect-all googleapiclient
+          --collect-all google_auth_oauthlib
+          --collect-all msal
+          --collect-all customtkinter
+          --add-data "CHANGELOG.md;."
+          auto_yt.py
+
+      - name: Create ZIP and latest.json
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $PWD "dist\AutoYouTubeUploader"
+          $zipName = "AutoYouTubeUploader-$env:VERSION.zip"
+          $zipPath = Join-Path $PWD "dist\$zipName"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($appDir, $zipPath)
+          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+              version = $env:VERSION
+              download_url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$zipName"
+              sha256 = $hash
+              notes = $env:RELEASE_NOTES
+          } | ConvertTo-Json
+          $manifestPath = Join-Path $PWD "dist\latest.json"
+          [System.IO.File]::WriteAllText($manifestPath, $manifest, (New-Object System.Text.UTF8Encoding($false)))
+          "ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MANIFEST_PATH=$manifestPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Attach ZIP and manifest to the release
+        shell: pwsh
+        run: gh release upload $env:TAG $env:ZIP_PATH $env:MANIFEST_PATH --clobber

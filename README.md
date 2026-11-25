@@ -154,23 +154,19 @@ Development loop (fast, no zip):
 
 Publishing a release (only when you are done editing):
 
-1. Increment `APP_VERSION` in `auto_yt.py`, commit, run `.\build_exe.ps1`, and push.
-2. Dry run to create the zip and manifest without publishing:
+1. Increment `APP_VERSION` in `auto_yt.py`, commit, and push to `main`.
+2. On GitHub, create a new release with the tag `vX.Y.Z` (matching `APP_VERSION`), a
+   title, and release notes. Publish it as a normal release, not a pre-release.
 
-   ```powershell
-   .\publish_update.ps1 -DryRun
-   ```
+Publishing the release starts the **Release** workflow
+([.github/workflows/release.yml](.github/workflows/release.yml)). It runs the tests,
+builds the folder on a Windows runner, creates `AutoYouTubeUploader-X.Y.Z.zip` and
+`latest.json` (the release notes go into the manifest), and attaches both to the release.
+If the tag doesn't match `APP_VERSION`, the workflow fails and nothing is attached. Clients
+see the update on their next hourly check, once the assets are attached.
 
-3. Publish. This tags `vX.Y.Z`, pushes the tag, and creates a public GitHub release with
-   the ZIP and `latest.json`. It needs the GitHub CLI (`gh`) and `gh auth login`:
-
-   ```powershell
-   .\publish_update.ps1 -Notes "Describe this release"
-   ```
-
-The script refuses to run if the test folder is older than the sources, the working tree
-has uncommitted changes, HEAD is not pushed, or the tag already exists. It also refuses
-if `config.json`, `client.json`, or `token.json` are in the folder.
+The workflow builds from a clean checkout, so `config.json`, `client.json`, and `token.json`
+are never included.
 
 This is poll-based update delivery: open clients notice a published update during their
 next hourly check.
