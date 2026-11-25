@@ -9,7 +9,7 @@ All notable changes to Auto YouTube Uploader are listed here, newest first.
 - Updates are delivered as a ZIP of that folder. The update replaces program files and keeps
   `config.json` and per-user data.
 - Default update source is the GitHub Releases `latest.json`, so no URL needs to be typed.
-- Build can code-sign the EXE with `AUTOYT_SIGN_PFX` (Windows SmartScreen guidance in README).
+- Build can optionally code-sign the EXE with `AUTOYT_SIGN_PFX` (see README).
 
 ## 1.2.0
 

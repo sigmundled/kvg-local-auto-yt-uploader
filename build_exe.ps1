@@ -62,5 +62,5 @@ if ($SignPfx) {
     Write-Host "Signed $Executable"
 }
 else {
-    Write-Warning "AUTOYT_SIGN_PFX is not set, so the EXE is unsigned. Windows SmartScreen may block it for other users."
+    Write-Host "AUTOYT_SIGN_PFX is not set, so the EXE is unsigned."
 }

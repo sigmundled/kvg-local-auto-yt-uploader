@@ -131,27 +131,10 @@ setup, and then authenticates with their own Google/YouTube profile.
 The selected client JSON is reused, but access and refresh tokens remain separate for
 each Windows user.
 
-### Windows SmartScreen warning
-
-Files downloaded from the internet are checked by Windows SmartScreen. An unsigned EXE
-from a new publisher can show "Windows protected your PC". To run it:
-
-1. Right-click the downloaded ZIP, choose **Properties**, tick **Unblock**, and click OK
-   before extracting. Or click **More info** and then **Run anyway** on the warning.
-2. If your organization blocks unknown apps, ask IT to allow this app.
-
-The real fix is an Authenticode code-signing certificate. Set these variables before
-building, and `build_exe.ps1` signs the EXE with `signtool` (Windows SDK required):
-
-```powershell
-$env:AUTOYT_SIGN_PFX = "C:\secure\codesign.pfx"
-$env:AUTOYT_SIGN_PFX_PASSWORD = "<pfx password>"   # optional
-.\build_exe.ps1
-```
-
-Never commit the `.pfx` file or its password. Optionally set `AUTOYT_SIGN_TIMESTAMP_URL`
-to a different RFC 3161 timestamp server. Without these variables the build still works,
-but the EXE stays unsigned.
+Optional code signing: set `AUTOYT_SIGN_PFX` (and optionally `AUTOYT_SIGN_PFX_PASSWORD`
+and `AUTOYT_SIGN_TIMESTAMP_URL`) before building, and `build_exe.ps1` signs the EXE with
+`signtool` (Windows SDK required). Never commit the `.pfx` file or its password. Without
+these variables the build is unsigned, which is the current setup.
 
 ## Client updates
 
@@ -163,25 +146,31 @@ The client checks that manifest during each hourly cycle and shows an update not
 SHA-256 hash, and are verified before the application folder is replaced. The update
 replaces the program files only; `config.json` and per-user data are kept.
 
-For each release, increment `APP_VERSION` in `auto_yt.py`, rebuild, then create the
-update ZIP and its manifest:
+Development loop (fast, no zip):
 
-```powershell
-.\publish_update.ps1 `
-  -Version "1.3.0" `
-  -DownloadUrl "https://github.com/sigmundled/kvg-local-auto-yt-uploader/releases/download/v1.3.0/AutoYouTubeUploader-1.3.0.zip" `
-  -Notes "Describe this release"
-```
+1. Edit the code and run `python -m unittest discover -s tests`.
+2. Run `.\build_exe.ps1`. This rebuilds only the test folder `dist\AutoYouTubeUploader\`.
+3. Test `dist\AutoYouTubeUploader\AutoYouTubeUploader.exe`. Repeat as needed.
 
-Then publish a GitHub release (not a pre-release) that contains both files, so the
-`releases/latest/download/latest.json` link points to it:
+Publishing a release (only when you are done editing):
 
-```powershell
-gh release create v1.3.0 `
-  "dist\AutoYouTubeUploader-1.3.0.zip" `
-  "dist\latest.json" `
-  --title "v1.3.0" --notes "Describe this release"
-```
+1. Increment `APP_VERSION` in `auto_yt.py`, commit, run `.\build_exe.ps1`, and push.
+2. Dry run to create the zip and manifest without publishing:
+
+   ```powershell
+   .\publish_update.ps1 -DryRun
+   ```
+
+3. Publish. This tags `vX.Y.Z`, pushes the tag, and creates a public GitHub release with
+   the ZIP and `latest.json`. It needs the GitHub CLI (`gh`) and `gh auth login`:
+
+   ```powershell
+   .\publish_update.ps1 -Notes "Describe this release"
+   ```
+
+The script refuses to run if the test folder is older than the sources, the working tree
+has uncommitted changes, HEAD is not pushed, or the tag already exists. It also refuses
+if `config.json`, `client.json`, or `token.json` are in the folder.
 
 This is poll-based update delivery: open clients notice a published update during their
 next hourly check.
