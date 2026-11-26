@@ -24,6 +24,7 @@ try {
         --collect-all google_auth_oauthlib `
         --collect-all msal `
         --collect-all customtkinter `
+        --collect-all pystray `
         --add-data "CHANGELOG.md;." `
         "auto_yt.py"
     if ($LASTEXITCODE -ne 0) {

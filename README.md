@@ -82,7 +82,7 @@ python .\auto_yt.py --workbook "C:\path\to\Request.xlsx" --row 12 --dry-run
 
 A dry run downloads and verifies but never signs in to YouTube or uploads. A normal run stores the video in `downloads`, checks nonzero length and known file size, rejects HTML sign-in pages, checks the MP4 signature for `.mp4`, and prints byte size and SHA-256. Only after these checks does it ask whether to upload. Answer `y` to continue; any other answer cancels. A successful upload is then written into the local workbook's `YouTube Link` cell.
 
-YouTube sign-in and upload happen only after download verification and confirmation. Uploads use the resumable API and remain private. Playlist insertion, thumbnails, captions, and music-license metadata are not handled yet.
+YouTube sign-in and upload happen only after download verification and confirmation. Uploads use the resumable API and remain private. Playlist insertion is manual: after an upload, the client displays the playlist from the workbook and reminds the user to review the video in YouTube Studio before making it public.
 
 ## Tests
 
@@ -109,9 +109,12 @@ inside that folder. The EXE performs a first-run setup:
 
 When open, the client checks for the latest blank-`YouTube Link` request immediately
 and then every hour. It verifies the matching local video, uploads it as private, and
-writes the resulting URL into the workbook. The window provides status/log output,
-`Check now`, `Settings`, and `Quit` controls. The installed client version and update
-status are displayed beneath the main status line.
+writes the resulting URL into the workbook. The window provides active-stage progress,
+an expandable latest-features panel, `Check now`, `Settings`, and `Quit` controls.
+Minimizing the window places it in the Windows system tray; the tray icon can restore
+or exit the client. A Windows notification appears after each completed upload.
+The YouTube action uses the play-mark from the official
+[YouTube brand resources](https://www.youtube.com/howyoutubeworks/resources/brand-resources/).
 
 Settings are saved in `config.json` in the same folder as the app (the EXE folder, or the
 project folder when run from source), so setup is not repeated on each launch. The folder
@@ -141,10 +144,13 @@ these variables the build is unsigned, which is the current setup.
 The default update manifest is
 `https://github.com/sigmundled/kvg-local-auto-yt-uploader/releases/latest/download/latest.json`.
 It is built into the client and is not configurable in the window.
-The client checks that manifest during each hourly cycle and shows an update notice with an
-`Update` button. Updates are accepted only over HTTPS, require a matching 64-character
-SHA-256 hash, and are verified before the application folder is replaced. The update
-replaces the program files only; `config.json` and per-user data are kept.
+The client checks that manifest during each hourly cycle. When an update is available,
+the user can download it, install a previously downloaded update, or download and install
+it in one action. Downloads show byte progress and are SHA-256 verified before the install
+option is enabled. The client stays open during the download. Installation opens a
+PowerShell console; keep it open until the update finishes. If that console is closed
+early, the client restarts and reports that the install was interrupted. The update
+replaces program files only; `config.json` and per-user data are kept.
 
 Development loop (fast, no zip):
 

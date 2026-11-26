@@ -17,9 +17,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+import pystray
+from PIL import Image, ImageDraw
 
 import auto_yt
-from updater import check_update, download_update, install_update
+from updater import check_update, download_update, install_update, _update_marker_path
 
 DEFAULT_INTERVAL_MINUTES = 60
 MIN_INTERVAL_MINUTES = 5
@@ -28,21 +30,23 @@ SUBTLE = ("#eef1f6", "#2a303d")
 SUBTLE_HOVER = ("#e0e5ee", "#353c4b")
 MUTED = ("#5f6b7a", "#9aa4b5")
 TEXT = ("#15181f", "#eef1f6")
-ACCENT = "#e62117"
-ACCENT_HOVER = "#b91c14"
+ACCENT = "#007b3d"
+ACCENT_HOVER = "#00632f"
+YOUTUBE_RED = "#ff0000"
+ERROR_RED = "#e62117"
 STATUS_COLORS = {
-    "ready": "#16a34a",
+    "ready": ACCENT,
     "busy": "#d97706",
-    "error": "#dc2626",
+    "error": ERROR_RED,
 }
-DONE_COLOR = "#16a34a"
+DONE_COLOR = ACCENT
 # (stage name from auto_yt.main, step label shown in the status card)
 STAGE_STEPS = [
-    ("checking", "Check"),
-    ("downloading", "Download"),
-    ("uploading", "Upload"),
-    ("thumbnail", "Thumbnail"),
-    ("saving", "Link"),
+    ("checking", "Checking workbook"),
+    ("downloading", "Downloading video"),
+    ("uploading", "Uploading video"),
+    ("thumbnail", "Uploading thumbnail"),
+    ("saving", "Saving link"),
 ]
 # Stages without a step of their own map onto the step they belong to.
 STAGE_INDEX = {"checking": 0, "downloading": 1, "confirm": 1, "uploading": 2, "thumbnail": 3, "saving": 4, "done": 5}
@@ -136,9 +140,9 @@ class SettingsDialog(ctk.CTkToplevel):
             font=_font(14),
             height=40,
             corner_radius=10,
-            fg_color=SUBTLE,
-            hover_color=SUBTLE_HOVER,
-            text_color=TEXT,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            text_color="white",
             command=self._cancel,
         ).pack(side="right", padx=8)
 
@@ -176,9 +180,9 @@ class SettingsDialog(ctk.CTkToplevel):
                     width=96,
                     height=36,
                     corner_radius=8,
-                    fg_color=SUBTLE,
-                    hover_color=SUBTLE_HOVER,
-                    text_color=TEXT,
+                    fg_color=ACCENT,
+                    hover_color=ACCENT_HOVER,
+                    text_color="white",
                     command=lambda k=key, kd=kind, t=title: self._browse(k, kd, t),
                 ).pack(side="left", padx=(8, 0))
 
@@ -263,19 +267,30 @@ class AutoYouTubeApp:
         self.busy = False
         self.paused = False
         self.available_update: dict[str, str] | None = None
+        self.downloaded_update: Path | None = None
+        self.install_after_download = False
         self.announced_update = ""
         self.last_link: str | None = None
+        self.last_playlist = ""
+        self.log_lines: list[str] = []
+        self.features_expanded = False
+        self.tray_icon: pystray.Icon | None = None
         self.interval_minutes = interval_minutes(config)
         self.next_check_at = 0.0
         self.smoke = bool(os.environ.get("AUTOYT_GUI_SMOKE_MARKER"))
 
         root.title(f"Auto YouTube Uploader {auto_yt.APP_VERSION}")
-        root.geometry("1040x780")
-        root.minsize(900, 700)
+        root.geometry("1040x820")
+        root.minsize(840, 720)
+        root.resizable(True, True)
         root.protocol("WM_DELETE_WINDOW", self._close)
+        root.bind("<Unmap>", self._on_minimize)
+        root.bind("<Configure>", self._resize_content)
         self._build()
         self._refresh_uploads()
         self._set_status("ready", "Ready")
+        if not self.smoke:
+            root.after(300, self._check_interrupted_update)
         if not self.smoke:
             self.next_check_at = time.time() + self.interval_minutes * 60
             root.after(400, self.check_now)
@@ -287,10 +302,10 @@ class AutoYouTubeApp:
     def _build(self) -> None:
         root = self.root
         root.grid_columnconfigure(0, weight=1)
-        root.grid_rowconfigure(4, weight=1)
+        root.grid_rowconfigure(5, weight=1)
 
         header = ctk.CTkFrame(root, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(22, 6))
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(16, 4))
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(header, text="Auto YouTube Uploader", font=_font(26, "bold"), anchor="w").grid(
             row=0, column=0, sticky="w"
@@ -314,29 +329,65 @@ class AutoYouTubeApp:
         )
         self.pill.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        self.update_bar = ctk.CTkFrame(root, fg_color=("#dbeafe", "#1e3a5f"), corner_radius=14)
-        self.update_label = ctk.CTkLabel(self.update_bar, text="", font=_font(13), anchor="w", justify="left")
-        self.update_label.pack(side="left", padx=18, pady=12, fill="x", expand=True)
-        self.install_button = ctk.CTkButton(
-            self.update_bar,
-            text="Install and restart",
-            width=180,
+        self.update_bar = ctk.CTkFrame(root, fg_color=("#edf8f1", "#173b2a"), corner_radius=14)
+        update_row = ctk.CTkFrame(self.update_bar, fg_color="transparent")
+        update_row.pack(fill="x", padx=14, pady=(10, 0))
+        self.update_label = ctk.CTkLabel(update_row, text="", font=_font(13, "bold"), anchor="w", justify="left")
+        self.update_label.pack(side="left", padx=(4, 12), fill="x", expand=True)
+        self.download_button = ctk.CTkButton(
+            update_row,
+            text="Download update",
+            width=140,
             height=36,
             corner_radius=10,
-            fg_color="#2563eb",
-            hover_color="#1d4ed8",
-            font=_font(13, "bold"),
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            font=_font(12, "bold"),
+            command=self.download_available_update,
+            state="disabled",
+        )
+        self.download_button.pack(side="left", padx=(0, 8))
+        self.install_button = ctk.CTkButton(
+            update_row,
+            text="Install update",
+            width=130,
+            height=36,
+            corner_radius=10,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            font=_font(12, "bold"),
             command=self.install_available_update,
             state="disabled",
         )
-        self.install_button.pack(side="right", padx=14, pady=10)
-        self.update_bar.grid(row=1, column=0, sticky="ew", padx=28, pady=(6, 0))
+        self.install_button.pack(side="left", padx=(0, 8))
+        self.download_install_button = ctk.CTkButton(
+            update_row,
+            text="Download and install",
+            width=170,
+            height=36,
+            corner_radius=10,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            font=_font(12, "bold"),
+            command=self.download_and_install_update,
+            state="disabled",
+        )
+        self.download_install_button.pack(side="left", padx=(0, 4))
+        self.update_warning = ctk.CTkLabel(
+            self.update_bar,
+            text="Don't close the CMD once it opens. It will look like it is doing nothing, but an active process is happening.",
+            font=_font(11),
+            text_color=MUTED,
+            anchor="w",
+        )
+        self.update_warning.pack(fill="x", padx=18, pady=(2, 8))
+        self.update_bar.grid(row=1, column=0, sticky="ew", padx=24, pady=(4, 0))
         self.update_bar.grid_remove()
 
         hero = ctk.CTkFrame(root, fg_color=CARD, corner_radius=18)
-        hero.grid(row=2, column=0, sticky="ew", padx=28, pady=8)
+        hero.grid(row=2, column=0, sticky="ew", padx=24, pady=6)
         top = ctk.CTkFrame(hero, fg_color="transparent")
-        top.pack(fill="x", padx=22, pady=(20, 10))
+        top.pack(fill="x", padx=18, pady=(14, 8))
         self.check_button = ctk.CTkButton(
             top,
             text="Check for requested videos now",
@@ -359,99 +410,152 @@ class AutoYouTubeApp:
         self.pause_switch.pack(side="right")
 
         actions = ctk.CTkFrame(hero, fg_color="transparent")
-        actions.pack(fill="x", padx=22, pady=(0, 20))
+        actions.pack(fill="x", padx=18, pady=(0, 12))
         secondary = [
             ("Open workbook", self.open_workbook),
             ("Open video folder", self.open_video_folder),
             ("Settings", self.open_settings),
             ("Check for updates", self.check_updates_only),
-            ("Changelog", self.open_changelog),
+            ("Latest features", self._toggle_features),
         ]
         for text, command in secondary:
-            self._secondary_button(actions, text, command).pack(side="left", padx=(0, 10))
+            self._secondary_button(actions, text, command).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
             actions,
             text="Quit",
             font=_font(13),
             height=36,
             corner_radius=10,
-            fg_color="transparent",
+            fg_color=ACCENT,
             border_width=1,
-            border_color=MUTED,
-            text_color=TEXT,
-            hover_color=SUBTLE,
+            border_color=ACCENT,
+            text_color="white",
+            hover_color=ACCENT_HOVER,
             command=self._close,
         ).pack(side="right")
 
+        self.features_panel = ctk.CTkFrame(root, fg_color=CARD, corner_radius=14)
+        ctk.CTkLabel(
+            self.features_panel,
+            text="LATEST UPDATE FEATURES",
+            font=_font(11, "bold"),
+            text_color=MUTED,
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(10, 2))
+        self.features_text = ctk.CTkLabel(
+            self.features_panel,
+            text=self._latest_features(),
+            font=_font(12),
+            anchor="w",
+            justify="left",
+            wraplength=950,
+        )
+        self.features_text.pack(fill="x", padx=18, pady=(0, 12))
+        self.features_panel.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 4))
+        self.features_panel.grid_remove()
+
         cards = ctk.CTkFrame(root, fg_color="transparent")
-        cards.grid(row=3, column=0, sticky="ew", padx=28, pady=8)
+        cards.grid(row=4, column=0, sticky="ew", padx=24, pady=6)
         cards.grid_columnconfigure((0, 1), weight=1, uniform="cards")
 
         status = self._card(cards, 0, "STATUS", padx=(0, 8))
         self.status_text = ctk.CTkLabel(status, text="Starting…", font=_font(20, "bold"), anchor="w")
-        self.status_text.pack(fill="x", padx=20, pady=(4, 2))
-        steps = ctk.CTkFrame(status, fg_color="transparent")
-        steps.pack(fill="x", padx=20, pady=(4, 6))
-        self.step_labels: list[ctk.CTkLabel] = []
-        for _, label in STAGE_STEPS:
-            step = ctk.CTkLabel(steps, text=label, font=_font(11, "bold"), text_color=MUTED)
-            step.pack(side="left", padx=(0, 10))
-            self.step_labels.append(step)
+        self.status_text.pack(fill="x", padx=18, pady=(0, 6))
         self.last_check_label = ctk.CTkLabel(
-            status, text="Last check: never", font=_font(13), text_color=MUTED, anchor="w"
+            status, text="Last check: never", font=_font(12), text_color=MUTED, anchor="w"
         )
-        self.last_check_label.pack(fill="x", padx=20)
-        self.next_check_label = ctk.CTkLabel(status, text="", font=_font(13), text_color=MUTED, anchor="w")
-        self.next_check_label.pack(fill="x", padx=20, pady=(0, 10))
-        self.progress = ctk.CTkProgressBar(status, height=8, progress_color=ACCENT)
+        self.last_check_label.pack(fill="x", padx=18)
+        self.next_check_label = ctk.CTkLabel(status, text="", font=_font(12), text_color=MUTED, anchor="w")
+        self.next_check_label.pack(fill="x", padx=18, pady=(0, 10))
+        self.progress_area = ctk.CTkFrame(status, fg_color="transparent")
+        self.progress = ctk.CTkProgressBar(
+            self.progress_area,
+            height=18,
+            fg_color=ACCENT_HOVER,
+            progress_color=ACCENT,
+        )
         self.progress.set(0)
-        self.progress.pack(fill="x", padx=20, pady=(0, 18))
+        self.progress.pack(fill="x", padx=18)
+        self.progress_text = ctk.CTkLabel(
+            self.progress_area,
+            text="",
+            font=_font(10, "bold"),
+            text_color="white",
+            fg_color="transparent",
+        )
+        self.progress_text.place(relx=0.5, rely=0.5, anchor="center")
+        self.progress_area.pack_forget()
 
         uploads = self._card(cards, 1, "UPLOADS", padx=(8, 0))
-        self.upload_count = ctk.CTkLabel(uploads, text="0", font=_font(34, "bold"), anchor="w")
-        self.upload_count.pack(fill="x", padx=20, pady=(0, 0))
         ctk.CTkLabel(
             uploads, text="videos uploaded from this computer", font=_font(12), text_color=MUTED, anchor="w"
-        ).pack(fill="x", padx=20)
+        ).pack(fill="x", padx=18, pady=(0, 0))
+        self.upload_count = ctk.CTkLabel(uploads, text="0", font=_font(34, "bold"), anchor="w")
+        self.upload_count.pack(fill="x", padx=18, pady=(0, 0))
         self.last_title = ctk.CTkLabel(
             uploads, text="No uploads yet", font=_font(13), anchor="w", justify="left", wraplength=380
         )
-        self.last_title.pack(fill="x", padx=20, pady=(10, 8))
+        self.last_title.pack(fill="x", padx=18, pady=(6, 8))
         link_row = ctk.CTkFrame(uploads, fg_color="transparent")
-        link_row.pack(fill="x", padx=20, pady=(0, 18))
-        self.open_link_button = self._secondary_button(link_row, "Open on YouTube", self.open_last_link)
+        link_row.pack(fill="x", padx=18, pady=(0, 10))
+        icon = Image.new("RGBA", (30, 22), (0, 0, 0, 0))
+        drawing = ImageDraw.Draw(icon)
+        drawing.rounded_rectangle((1, 2, 28, 20), radius=5, fill="white")
+        drawing.polygon(((12, 6), (12, 16), (20, 11)), fill=YOUTUBE_RED)
+        self.youtube_icon = ctk.CTkImage(light_image=icon, dark_image=icon, size=(24, 18))
+        self.open_link_button = ctk.CTkButton(
+            link_row,
+            text="Open on YouTube",
+            image=self.youtube_icon,
+            compound="left",
+            command=self.open_last_link,
+            height=36,
+            corner_radius=10,
+            font=_font(13, "bold"),
+            fg_color=YOUTUBE_RED,
+            hover_color="#cc0000",
+            text_color="white",
+        )
         self.open_link_button.configure(state="disabled")
         self.open_link_button.pack(side="left")
-        self.copy_link_button = self._secondary_button(link_row, "Copy link", self.copy_last_link)
+        self.copy_link_button = self._secondary_button(link_row, "Copy YouTube URL", self.copy_last_link)
         self.copy_link_button.configure(state="disabled")
         self.copy_link_button.pack(side="left", padx=(10, 0))
+        self.upload_instruction_frame = ctk.CTkFrame(uploads, fg_color=("#edf8f1", "#173b2a"), corner_radius=10)
+        self.upload_instruction = ctk.CTkLabel(
+            self.upload_instruction_frame,
+            text="",
+            font=_font(12),
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        )
+        self.upload_instruction.pack(fill="x", padx=12, pady=10)
+        self.upload_instruction_frame.pack_forget()
 
         log_card = ctk.CTkFrame(root, fg_color=CARD, corner_radius=16)
-        log_card.grid(row=4, column=0, sticky="nsew", padx=28, pady=(8, 24))
+        log_card.grid(row=5, column=0, sticky="nsew", padx=24, pady=(6, 16))
         log_header = ctk.CTkFrame(log_card, fg_color="transparent")
-        log_header.pack(fill="x", padx=20, pady=(14, 6))
+        log_header.pack(fill="x", padx=18, pady=(10, 4))
         ctk.CTkLabel(log_header, text="ACTIVITY", font=_font(11, "bold"), text_color=MUTED).pack(side="left")
-        self._secondary_button(log_header, "Open log file", self.open_log_file, width=120, height=28).pack(
-            side="right"
-        )
-        self._secondary_button(log_header, "Clear view", self._clear_log, width=100, height=28).pack(
-            side="right", padx=8
-        )
-        self.log_box = ctk.CTkTextbox(
+        self._secondary_button(log_header, "Clear", self._clear_log, width=74, height=28).pack(side="right")
+        self.log_view = ctk.CTkLabel(
             log_card,
-            font=_font(12, family="Consolas"),
-            wrap="word",
+            text="",
+            font=_font(11, family="Consolas"),
+            anchor="nw",
+            justify="left",
             corner_radius=10,
             fg_color=SUBTLE,
-            state="disabled",
         )
-        self.log_box.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+        self.log_view.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        self._start_tray_icon()
 
     def _card(self, parent: ctk.CTkFrame, column: int, title: str, padx: tuple[int, int]) -> ctk.CTkFrame:
         card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=16)
         card.grid(row=0, column=column, sticky="nsew", padx=padx)
         ctk.CTkLabel(card, text=title, font=_font(11, "bold"), text_color=MUTED, anchor="w").pack(
-            fill="x", padx=20, pady=(16, 6)
+            fill="x", padx=18, pady=(10, 2)
         )
         return card
 
@@ -471,9 +575,9 @@ class AutoYouTubeApp:
             height=height,
             corner_radius=10,
             font=_font(13),
-            fg_color=SUBTLE,
-            hover_color=SUBTLE_HOVER,
-            text_color=TEXT,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            text_color="white",
         )
 
     # Status and timing
@@ -481,6 +585,96 @@ class AutoYouTubeApp:
     def _set_status(self, kind: str, text: str) -> None:
         self.pill.configure(text=text, fg_color=STATUS_COLORS[kind])
         self.status_text.configure(text=text)
+
+    def _latest_features(self) -> str:
+        changelog = _read_changelog()
+        sections = changelog.split("\n## ")
+        if len(sections) < 2:
+            return "No release notes are available."
+        latest = sections[1].split("\n", 1)[-1].strip()
+        return latest or "No release notes are available."
+
+    def _toggle_features(self) -> None:
+        self.features_expanded = not self.features_expanded
+        if self.features_expanded:
+            self.features_panel.grid()
+        else:
+            self.features_panel.grid_remove()
+
+    def _resize_content(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        width = max(360, (event.width - 96) // 2)
+        self.last_title.configure(wraplength=width - 40)
+        self.upload_instruction.configure(wraplength=width - 44)
+        self.features_text.configure(wraplength=event.width - 96)
+        self.update_warning.configure(wraplength=event.width - 72)
+
+    def _start_tray_icon(self) -> None:
+        if self.smoke or os.name != "nt":
+            return
+        image = Image.new("RGBA", (64, 64), (0, 123, 61, 255))
+        drawing = ImageDraw.Draw(image)
+        drawing.rounded_rectangle((8, 15, 56, 49), radius=10, fill=(255, 0, 0, 255))
+        drawing.polygon(((28, 22), (28, 42), (43, 32)), fill=(255, 255, 255, 255))
+        menu = pystray.Menu(
+            pystray.MenuItem("Open Auto YouTube Uploader", self._restore_from_tray, default=True),
+            pystray.MenuItem("Exit", self._exit_from_tray),
+        )
+        self.tray_icon = pystray.Icon(
+            "AutoYouTubeUploader",
+            image,
+            "Auto YouTube Uploader",
+            menu,
+        )
+        self.tray_icon.run_detached()
+
+    def _on_minimize(self, _event: tk.Event) -> None:
+        if self.smoke or not self.tray_icon:
+            return
+
+        def hide_minimized() -> None:
+            if self.root.state() == "iconic":
+                self.root.withdraw()
+
+        self.root.after(100, hide_minimized)
+
+    def _restore_from_tray(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._show_window)
+
+    def _show_window(self) -> None:
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _exit_from_tray(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._close)
+
+    def _stop_tray_icon(self) -> None:
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None
+
+    def _check_interrupted_update(self) -> None:
+        marker = _update_marker_path()
+        if not marker.is_file():
+            return
+        try:
+            reason = marker.read_text(encoding="utf-8").strip()
+            marker.unlink()
+        except OSError as exc:
+            self._log(f"Could not read the previous update status: {exc}")
+            return
+        if reason.startswith("failed:"):
+            message = reason.partition(":")[2].strip()
+        else:
+            message = "The update did not finish. The CMD window may have been closed before installation completed."
+        messagebox.showerror(
+            "Update was not completed",
+            f"{message}\n\nCheck for updates and try again.",
+            parent=self.root,
+        )
 
     def _tick(self) -> None:
         due = self.next_check_at > 0 and time.time() >= self.next_check_at
@@ -494,13 +688,10 @@ class AutoYouTubeApp:
             return
         if self.paused:
             self.next_check_label.configure(text="Automatic checks are paused")
-            self.progress.set(0)
             return
         remaining = max(0, int(self.next_check_at - time.time()))
         minutes, seconds = divmod(remaining, 60)
         self.next_check_label.configure(text=f"Next automatic check in {minutes}m {seconds:02d}s")
-        total = self.interval_minutes * 60
-        self.progress.set(min(1.0, 1 - remaining / total))
 
     def _toggle_pause(self) -> None:
         self.paused = not bool(self.pause_switch.get())
@@ -515,23 +706,16 @@ class AutoYouTubeApp:
 
     def _reset_steps(self) -> None:
         self.current_stage = "checking"
-        for step in self.step_labels:
-            step.configure(text_color=MUTED)
-        for (_, label), step in zip(STAGE_STEPS, self.step_labels):
-            step.configure(text=label)
 
     def _show_stage(self, name: str, detail: str, fraction: float | None) -> None:
         self.current_stage = name
-        index = STAGE_INDEX.get(name, 0)
-        for position, ((_, label), step) in enumerate(zip(STAGE_STEPS, self.step_labels)):
-            if position < index:
-                step.configure(text=f"✓ {label}", text_color=DONE_COLOR)
-            elif position == index and name != "done":
-                step.configure(text=f"● {label}", text_color=ACCENT)
-            else:
-                step.configure(text=label, text_color=MUTED)
-        if name != "done" and detail:
-            self.status_text.configure(text=detail)
+        label = dict(STAGE_STEPS).get(name, "Working")
+        text = f"{label} · {detail}" if detail and detail.casefold() != label.casefold() else label
+        if fraction is not None:
+            text += f" ({int(fraction * 100)}%)"
+        self.progress_text.configure(text=text)
+        if not self.progress_area.winfo_manager():
+            self.progress_area.pack(fill="x", pady=(8, 0))
         if fraction is None:
             self.progress.configure(mode="indeterminate")
             self.progress.start()
@@ -539,14 +723,17 @@ class AutoYouTubeApp:
             self.progress.stop()
             self.progress.configure(mode="determinate")
             self.progress.set(fraction)
+            self.progress_text.configure(text=f"{text} ({int(fraction * 100)}%)")
 
     def check_now(self) -> None:
         if self.busy:
             return
         self.busy = True
         self._reset_steps()
-        self._set_status("busy", "Checking…")
+        self._set_status("busy", "Checking")
         self.check_button.configure(state="disabled", text="Checking…")
+        self.progress_text.configure(text="Checking workbook")
+        self.progress_area.pack(fill="x", pady=(8, 0))
         self.progress.configure(mode="indeterminate")
         self.progress.start()
         self._log("Checking the workbook for new requests…")
@@ -576,19 +763,25 @@ class AutoYouTubeApp:
         if self.busy:
             return
         self._log("Checking for client updates…")
-        threading.Thread(target=self._run_update_check, daemon=True).start()
+        self.busy = True
+        self.check_button.configure(state="disabled")
+        self._set_status("busy", "Checking updates")
+        self._show_progress("Checking for updates", None)
+        threading.Thread(target=self._run_update_check, args=(True,), daemon=True).start()
 
-    def _run_update_check(self) -> None:
+    def _run_update_check(self, standalone: bool = False) -> None:
         try:
             update = check_update(auto_yt.DEFAULT_UPDATE_MANIFEST_URL, auto_yt.APP_VERSION)
             if update:
                 note = f"Installed {auto_yt.APP_VERSION} · version {update['version']} available"
             else:
-                note = f"Installed {auto_yt.APP_VERSION} · up to date"
+                note = f"Installed {auto_yt.APP_VERSION} · no newer version"
             self.events.put(("update", (update, note)))
         except Exception as exc:
             self.events.put(("log", f"Update check failed: {exc}"))
             self.events.put(("update", (None, "Update check failed; see activity log")))
+        if standalone:
+            self.events.put(("update_check_done", None))
 
     def _apply_update(self, payload: tuple[dict[str, str] | None, str]) -> None:
         update, note = payload
@@ -596,17 +789,25 @@ class AutoYouTubeApp:
         self.update_label_note = note
         if update:
             self.available_update = update
+            staged = self._staged_update_dir(update["version"])
+            self.downloaded_update = staged if (staged / "AutoYouTubeUploader.exe").is_file() else None
             self.update_label.configure(
-                text=f"Version {update['version']} is ready to install.  {update.get('notes', '')}".strip()
+                text=f"Version {update['version']} is available"
             )
-            self.install_button.configure(state="normal")
+            self.download_button.configure(state="normal" if not self.downloaded_update else "disabled")
+            self.install_button.configure(state="normal" if self.downloaded_update else "disabled")
+            self.download_install_button.configure(state="normal" if not self.downloaded_update else "disabled")
+            self.features_text.configure(text=update.get("notes") or self._latest_features())
             self.update_bar.grid()
             if self.announced_update != update["version"]:
                 self.announced_update = update["version"]
                 self._log(f"Client update {update['version']} is available.")
         else:
             self.available_update = None
+            self.downloaded_update = None
+            self.download_button.configure(state="disabled")
             self.install_button.configure(state="disabled")
+            self.download_install_button.configure(state="disabled")
             self.update_bar.grid_remove()
         self.last_check_label.configure(text=f"{self.last_check_label.cget('text').split('  ·  ')[0]}  ·  {note}")
 
@@ -615,41 +816,148 @@ class AutoYouTubeApp:
         self.progress.stop()
         self.progress.configure(mode="determinate")
         self.progress.set(0)
+        self.progress_area.pack_forget()
         self.check_button.configure(state="normal", text="Check for requested videos now")
         self.last_check_label.configure(text=f"Last check: {datetime.now():%d %b %Y, %H:%M}")
         self.next_check_at = time.time() + self.interval_minutes * 60
         self._refresh_uploads()
         if not result["ok"]:
             failed_step = dict(STAGE_STEPS).get(self.current_stage, "start")
-            self._set_status("error", f"Failed at {failed_step.lower()} step")
+            self._set_status("error", f"Failed: {failed_step.lower()}")
         elif result["uploaded"]:
-            self._set_status("ready", "Uploaded")
+            self._set_status("ready", "Upload complete")
+            self._show_upload_instruction()
+            self._notify_upload()
         else:
-            self._set_status("ready", "Up to date")
+            self._set_status("ready", "Ready")
 
-    def install_available_update(self) -> None:
+    def _staged_update_dir(self, version: str) -> Path:
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AutoYouTubeUploader" / "updates"
+        return base / f"AutoYouTubeUploader-{version}"
+
+    def download_available_update(self) -> None:
+        self._download_available_update(install_after=False)
+
+    def download_and_install_update(self) -> None:
+        self._download_available_update(install_after=True)
+
+    def _download_available_update(self, install_after: bool) -> None:
         if not self.available_update or self.busy:
             return
-        if not messagebox.askyesno(
+        self.busy = True
+        self.check_button.configure(state="disabled")
+        self.install_after_download = install_after
+        self._set_status("busy", "Downloading update")
+        self._set_update_buttons("disabled")
+        self._show_progress("Downloading update", None)
+        self._log(f"Downloading client update {self.available_update['version']}…")
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(self.available_update, install_after),
+            daemon=True,
+        ).start()
+
+    def _download_update_worker(self, update: dict[str, str], install_after: bool) -> None:
+        try:
+            staged = download_update(
+                update,
+                on_progress=lambda written, total: self.events.put(("update_progress", (written, total))),
+            )
+            self.events.put(("update_downloaded", (staged, install_after)))
+        except Exception as exc:
+            self.events.put(("log", f"Update download failed: {exc}"))
+            self.events.put(("update_download_failed", str(exc)))
+
+    def _update_download_progress(self, written: int, total: int | None) -> None:
+        detail = f"Downloading update · {written / 1048576:,.0f} MB"
+        if total:
+            detail += f" / {total / 1048576:,.0f} MB"
+            fraction = min(1.0, written / total)
+        else:
+            fraction = None
+        self._show_progress(detail, fraction)
+
+    def _finish_update_download(self, staged: Path, install_after: bool) -> None:
+        self.busy = False
+        self.downloaded_update = staged
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self.progress.set(1)
+        self.progress_area.pack_forget()
+        self.check_button.configure(state="normal")
+        self._set_status("ready", "Update ready to install")
+        if self.available_update:
+            self.update_label.configure(text=f"Version {self.available_update['version']} downloaded and verified")
+        self._restore_update_buttons()
+        self.install_button.configure(state="normal")
+        self._log("Update downloaded and verified. Install it when ready.")
+        if install_after:
+            self._start_update_install(ask_confirmation=False)
+
+    def _finish_update_download_error(self, error: str) -> None:
+        self.busy = False
+        self.progress.stop()
+        self.progress_area.pack_forget()
+        self.check_button.configure(state="normal")
+        self._set_status("error", "Update download failed")
+        self._restore_update_buttons()
+        self._log(f"Update download error: {error}")
+        messagebox.showerror("Could not download update", error, parent=self.root)
+
+    def _set_update_buttons(self, state: str) -> None:
+        self.download_button.configure(state=state)
+        self.install_button.configure(state=state)
+        self.download_install_button.configure(state=state)
+
+    def _restore_update_buttons(self) -> None:
+        if not self.available_update:
+            self._set_update_buttons("disabled")
+            return
+        is_downloaded = self.downloaded_update is not None
+        self.download_button.configure(state="disabled" if is_downloaded else "normal")
+        self.install_button.configure(state="normal" if is_downloaded else "disabled")
+        self.download_install_button.configure(state="disabled" if is_downloaded else "normal")
+
+    def _show_progress(self, text: str, fraction: float | None) -> None:
+        self.progress_text.configure(text=text)
+        if not self.progress_area.winfo_manager():
+            self.progress_area.pack(fill="x", pady=(8, 0))
+        if fraction is None:
+            self.progress.stop()
+            self.progress.configure(mode="indeterminate")
+            self.progress.start()
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress.set(fraction)
+
+    def install_available_update(self) -> None:
+        self._start_update_install(ask_confirmation=True)
+
+    def _start_update_install(self, ask_confirmation: bool) -> None:
+        if not self.downloaded_update or self.busy:
+            return
+        if ask_confirmation and not messagebox.askyesno(
             "Install update",
-            f"Install AutoYouTubeUploader {self.available_update['version']} and restart?",
+            "The verified update is ready.\n\nThe client will close and a CMD window will open. "
+            "Do not close that window while it is running.",
             parent=self.root,
         ):
             return
         self.busy = True
-        self._set_status("busy", "Downloading update…")
-        self.install_button.configure(state="disabled")
-        threading.Thread(target=self._install_update_worker, args=(self.available_update,), daemon=True).start()
+        self._set_status("busy", "Installing update")
+        self._set_update_buttons("disabled")
+        self._show_progress("Starting installer", None)
+        threading.Thread(target=self._install_update_worker, args=(self.downloaded_update,), daemon=True).start()
 
-    def _install_update_worker(self, update: dict[str, str]) -> None:
+    def _install_update_worker(self, staged: Path) -> None:
         try:
-            downloaded = download_update(update)
-            install_update(downloaded)
-            self.events.put(("log", "Verified update installed; restarting…"))
+            install_update(staged)
+            self.events.put(("log", "Installer CMD opened; leaving it open while it updates the client."))
             self.events.put(("exit", None))
         except Exception as exc:
             self.events.put(("log", f"Update failed: {exc}"))
-            self.events.put(("install_failed", None))
+            self.events.put(("install_failed", str(exc)))
 
     # Uploads, settings and files
 
@@ -665,12 +973,34 @@ class AutoYouTubeApp:
             latest = entries[-1]
             self.last_link = str(latest.get("youtube_link") or "") or None
             self.last_title.configure(text=str(latest.get("title") or "Untitled video"))
+            self.last_playlist = str(latest.get("playlist") or "").strip()
         else:
             self.last_link = None
             self.last_title.configure(text="No uploads yet")
+            self.last_playlist = ""
         link_state = "normal" if self.last_link else "disabled"
         self.open_link_button.configure(state=link_state)
         self.copy_link_button.configure(state=link_state)
+
+    def _show_upload_instruction(self) -> None:
+        playlist = self.last_playlist or "the playlist listed in the Excel document (if one is selected)"
+        self.upload_instruction.configure(
+            text=(
+                "The upload is done. Please go to the uploaded video in YouTube Studio, check that it looks good, "
+                f"add the playlist: {playlist}, and make the video public."
+            )
+        )
+        if not self.upload_instruction_frame.winfo_manager():
+            self.upload_instruction_frame.pack(fill="x", padx=18, pady=(0, 12))
+
+    def _notify_upload(self) -> None:
+        if not self.tray_icon:
+            return
+        try:
+            title = self.last_title.cget("text")
+            self.tray_icon.notify(f"Upload complete: {title}", "Auto YouTube Uploader")
+        except Exception as exc:
+            self._log(f"Could not show the Windows upload notification: {exc}")
 
     def open_last_link(self) -> None:
         if self.last_link:
@@ -687,12 +1017,6 @@ class AutoYouTubeApp:
 
     def open_video_folder(self) -> None:
         self._open_target(self._config().get("local_video_dir", str(auto_yt.DEFAULT_LOCAL_VIDEO_DIR)))
-
-    def open_log_file(self) -> None:
-        log_path = _log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.touch(exist_ok=True)
-        self._open_target(str(log_path))
 
     def _open_target(self, target: str) -> None:
         try:
@@ -714,18 +1038,6 @@ class AutoYouTubeApp:
             self._log("Settings saved.")
             self.check_now()
 
-    def open_changelog(self) -> None:
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title(f"Changelog - Auto YouTube Uploader {auto_yt.APP_VERSION}")
-        dialog.geometry("640x560")
-        dialog.configure(fg_color=CARD)
-        dialog.transient(self.root)
-        text = ctk.CTkTextbox(dialog, font=_font(13), fg_color=SUBTLE, text_color=TEXT, wrap="word")
-        text.pack(fill="both", expand=True, padx=20, pady=20)
-        text.insert("1.0", _read_changelog())
-        text.configure(state="disabled")
-        dialog.after(100, dialog.lift)
-
     # Activity log and event loop
 
     def _log(self, text: str) -> None:
@@ -734,10 +1046,9 @@ class AutoYouTubeApp:
         if not lines:
             return
         block = "\n".join(f"[{stamp}] {line}" for line in lines) + "\n"
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", block)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        self.log_lines.extend(block.rstrip().splitlines())
+        self.log_lines = self.log_lines[-5:]
+        self.log_view.configure(text="\n".join(self.log_lines))
         with contextlib.suppress(OSError):
             log_path = _log_path()
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -745,9 +1056,8 @@ class AutoYouTubeApp:
                 stream.write(block)
 
     def _clear_log(self) -> None:
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
+        self.log_lines.clear()
+        self.log_view.configure(text="")
 
     def _process_events(self) -> None:
         while True:
@@ -763,20 +1073,40 @@ class AutoYouTubeApp:
                 self._show_stage(*value)  # type: ignore[misc]
             elif kind == "done":
                 self._finish_check(value)  # type: ignore[arg-type]
+            elif kind == "update_progress":
+                self._update_download_progress(*value)  # type: ignore[arg-type]
+            elif kind == "update_downloaded":
+                self._finish_update_download(*value)  # type: ignore[arg-type]
+            elif kind == "update_download_failed":
+                self._finish_update_download_error(str(value))
+            elif kind == "update_check_done":
+                self.busy = False
+                self.progress.stop()
+                self.progress_area.pack_forget()
+                self.check_button.configure(state="normal")
+                self._set_status("ready", "Ready")
             elif kind == "install_failed":
                 self.busy = False
+                self.progress.stop()
+                self.progress_area.pack_forget()
                 self._set_status("error", "Update failed")
-                if self.available_update:
-                    self.install_button.configure(state="normal")
+                self._restore_update_buttons()
+                messagebox.showerror("Could not start update", str(value), parent=self.root)
             elif kind == "exit":
+                self._stop_tray_icon()
                 self.root.destroy()
                 return
         self.root.after(150, self._process_events)
 
     def _close(self) -> None:
         if self.busy:
-            messagebox.showwarning("Please wait", "A workbook check or update is still running.", parent=self.root)
+            messagebox.showwarning(
+                "Please wait",
+                "A workbook check or update is still running. You can minimize the client to the system tray.",
+                parent=self.root,
+            )
             return
+        self._stop_tray_icon()
         self.root.destroy()
 
 

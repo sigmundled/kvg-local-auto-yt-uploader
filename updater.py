@@ -11,6 +11,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 import requests
 
@@ -68,7 +69,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download_update(update: dict[str, str]) -> Path:
+def download_update(
+    update: dict[str, str],
+    on_progress: Callable[[int, int | None], None] | None = None,
+) -> Path:
     """Download and verify an update ZIP, returning the extracted application folder."""
     target_dir = (
         Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AutoYouTubeUploader" / "updates"
@@ -81,10 +85,18 @@ def download_update(update: dict[str, str]) -> Path:
     temporary = target_dir / f".AutoYouTubeUploader-{version}.download"
     with requests.get(update["download_url"], stream=True, timeout=(15, 120)) as response:
         response.raise_for_status()
+        try:
+            total = int(response.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            total = 0
+        written = 0
         with temporary.open("wb") as stream:
             for block in response.iter_content(chunk_size=1024 * 1024):
                 if block:
                     stream.write(block)
+                    written += len(block)
+                    if on_progress:
+                        on_progress(written, total or None)
     if _sha256(temporary) != update["sha256"]:
         temporary.unlink(missing_ok=True)
         raise ValueError("The downloaded update failed its SHA-256 verification.")
@@ -103,44 +115,98 @@ def download_update(update: dict[str, str]) -> Path:
     return staged
 
 
-def install_update(staged: Path) -> None:
-    """Replace the installed application folder once this process exits, then relaunch it.
+def _update_marker_path() -> Path:
+    data_dir = (
+        Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AutoYouTubeUploader"
+        if os.name == "nt"
+        else Path.home() / "AutoYouTubeUploader"
+    )
+    return data_dir / "update_install_pending.json"
+
+
+def install_update(staged: Path) -> subprocess.Popen:
+    """Start a visible installer that replaces the application after this process exits.
 
     Only the application files are replaced. config.json, which lives beside the EXE,
-    is not part of the update archive and is left untouched.
+    is not part of the update archive and is left untouched. A marker is retained until
+    the installer finishes, so an interrupted install can be reported on the next launch.
     """
     if not getattr(sys, "frozen", False):
         raise RuntimeError("Automatic replacement is available only in the packaged EXE.")
     executable = Path(sys.executable).resolve()
     app_dir = executable.parent
     script = Path(tempfile.gettempdir()) / f"auto-yt-update-{os.getpid()}.ps1"
+    watcher_script = Path(tempfile.gettempdir()) / f"auto-yt-update-watch-{os.getpid()}.ps1"
+    marker = _update_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("pending", encoding="utf-8")
 
     def ps_quote(path: Path) -> str:
         return "'" + str(path).replace("'", "''") + "'"
 
-    script.write_text(
-        (
-            f"$process = Get-Process -Id {os.getpid()} -ErrorAction SilentlyContinue\n"
-            "if ($process) { $process.WaitForExit() }\n"
-            f"Remove-Item -LiteralPath {ps_quote(app_dir / '_internal')} -Recurse -Force -ErrorAction SilentlyContinue\n"
-            f"Copy-Item -Path {ps_quote(staged / '*')} -Destination {ps_quote(app_dir)} -Recurse -Force\n"
-            f"Start-Process -FilePath {ps_quote(executable)}\n"
-            f"Remove-Item -LiteralPath {ps_quote(staged)} -Recurse -Force -ErrorAction SilentlyContinue\n"
-            f"Remove-Item -LiteralPath {ps_quote(script)} -Force -ErrorAction SilentlyContinue\n"
-        ),
-        encoding="utf-8",
-    )
-    subprocess.Popen(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-            str(script),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-    )
+    try:
+        script.write_text(
+            (
+                "$ErrorActionPreference = 'Stop'\n"
+                "try {\n"
+                f"  $process = Get-Process -Id {os.getpid()} -ErrorAction SilentlyContinue\n"
+                "  if ($process) { $process.WaitForExit() }\n"
+                f"  Remove-Item -LiteralPath {ps_quote(app_dir / '_internal')} -Recurse -Force -ErrorAction SilentlyContinue\n"
+                f"  Copy-Item -Path {ps_quote(staged / '*')} -Destination {ps_quote(app_dir)} -Recurse -Force\n"
+                f"  Remove-Item -LiteralPath {ps_quote(marker)} -Force -ErrorAction SilentlyContinue\n"
+                f"  Start-Process -FilePath {ps_quote(executable)}\n"
+                f"  Remove-Item -LiteralPath {ps_quote(staged)} -Recurse -Force -ErrorAction SilentlyContinue\n"
+                "  Write-Host 'Update complete. The client is restarting.'\n"
+                "} catch {\n"
+                f"  Set-Content -LiteralPath {ps_quote(marker)} -Value ('failed: ' + $_.Exception.Message)\n"
+                "  Write-Host ('Update failed: ' + $_.Exception.Message)\n"
+                "}\n"
+                f"Remove-Item -LiteralPath {ps_quote(script)} -Force -ErrorAction SilentlyContinue\n"
+            ),
+            encoding="utf-8",
+        )
+        installer = subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NoExit",
+                "-File",
+                str(script),
+            ],
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+        watcher_script.write_text(
+            (
+                f"$installer = Get-Process -Id {installer.pid} -ErrorAction SilentlyContinue\n"
+                "if ($installer) { $installer.WaitForExit() }\n"
+                f"$client = Get-Process -Id {os.getpid()} -ErrorAction SilentlyContinue\n"
+                "if ($client) { $client.WaitForExit() }\n"
+                f"if (Test-Path -LiteralPath {ps_quote(marker)}) {{\n"
+                f"  if ((Get-Content -LiteralPath {ps_quote(marker)} -Raw).Trim() -eq 'pending') {{\n"
+                f"    Set-Content -LiteralPath {ps_quote(marker)} -Value 'failed: The installer window was closed before the update completed.'\n"
+                "  }\n"
+                f"  Start-Process -FilePath {ps_quote(executable)}\n"
+                "}\n"
+                f"Remove-Item -LiteralPath {ps_quote(watcher_script)} -Force -ErrorAction SilentlyContinue\n"
+            ),
+            encoding="utf-8",
+        )
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(watcher_script),
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return installer
+    except OSError:
+        if "installer" in locals():
+            installer.terminate()
+        marker.unlink(missing_ok=True)
+        script.unlink(missing_ok=True)
+        watcher_script.unlink(missing_ok=True)
+        raise

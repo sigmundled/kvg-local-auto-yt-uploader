@@ -2,6 +2,19 @@
 
 All notable changes to Auto YouTube Uploader are listed here, newest first.
 
+## 1.4.1
+
+- The client window can be resized, the activity display no longer scrolls, and status
+  progress appears only while a check or update is active.
+- Update downloads now show progress and remain separate from installation. Download,
+  install, and download-and-install actions are available; an interrupted console install
+  is reported when the client restarts.
+- Minimizing places the client in the Windows system tray. Completed uploads trigger a
+  Windows notification and show the YouTube Studio review, playlist, and publish
+  instructions.
+- Added a collapsed-by-default latest-features panel, tightened the status/uploads
+  spacing, and updated button colors and YouTube link actions.
+
 ## 1.4.0
 
 - Downloads: column M links to Cloudinary files and to `download.kvernelandgroup.com` pages
