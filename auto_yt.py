@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import requests
 GRAPH_SCOPES = ["Files.Read.All", "Sites.Read.All"]
 YOUTUBE_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 MP4_SIGNATURE = b"ftyp"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 DEFAULT_UPDATE_MANIFEST_URL = (
     "https://github.com/sigmundled/kvg-local-auto-yt-uploader/releases/latest/download/latest.json"
 )
@@ -68,7 +69,11 @@ ALIASES = {
     "youtube": {"youtubelink", "youtubeurl", "uploadedvideolink"},
     "language": {"language", "videolanguage", "defaultlanguage"},
     "size": {"videosize", "filesize", "size"},
+    "thumbnail": {"thumbnail", "thumbnailimage", "thumbnailfile", "thumbnailname"},
 }
+THUMBNAIL_COLUMN_INDEX = 13  # Column N, used when the sheet has no thumbnail header.
+THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
+THUMBNAIL_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,7 @@ class VideoRequest:
     video_name: str
     expected_size: int | None
     youtube_link: str
+    thumbnail_name: str = ""
 
 
 def _norm(value: object) -> str:
@@ -183,6 +189,11 @@ def _make_request(
     except ValueError:
         size = embedded_size
     tag_col = _column(headers, "tags")
+    thumb_col = _column(headers, "thumbnail")
+    if thumb_col is None and len(headers) > THUMBNAIL_COLUMN_INDEX and headers[THUMBNAIL_COLUMN_INDEX] is not None:
+        thumb_col = str(headers[THUMBNAIL_COLUMN_INDEX])
+    thumbnail_text = str(values.get(thumb_col) or "").strip() if thumb_col else ""
+    thumbnail_name = Path(unquote(urlsplit(thumbnail_text).path or thumbnail_text)).name
     return VideoRequest(
         row_number=row_number,
         row_id=field("id") or str(row_number),
@@ -195,6 +206,7 @@ def _make_request(
         video_name=name,
         expected_size=size,
         youtube_link=field("youtube"),
+        thumbnail_name=thumbnail_name,
     )
 
 
@@ -415,6 +427,7 @@ def _stream_response(
     response: requests.Response,
     destination: Path,
     expected_size: int | None,
+    progress: Callable[[int, int | None], None] | None = None,
 ) -> None:
     response.raise_for_status()
     if "text/html" in response.headers.get("Content-Type", "").lower():
@@ -426,10 +439,14 @@ def _stream_response(
     partial = destination.with_suffix(destination.suffix + ".part")
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
+        written = 0
         with partial.open("wb") as stream:
             for block in response.iter_content(chunk_size=1024 * 1024):
                 if block:
                     stream.write(block)
+                    written += len(block)
+                    if progress:
+                        progress(written, size_to_check)
         verify_download(partial, size_to_check)
         if destination.suffix.lower() == ".mp4":
             with partial.open("rb") as stream:
@@ -473,11 +490,46 @@ def _find_local_video(directory: str | Path, name: str) -> Path:
     return matches[0]
 
 
+def _is_sharepoint_host(host: str | None) -> bool:
+    return bool(host) and host.lower().endswith((".sharepoint.com", "-my.sharepoint.com"))
+
+
+_EMBEDDED_VIDEO_PATTERN = re.compile(
+    r"https://res\.cloudinary\.com/[^\s\"'<>]+?\.mp4(?:\?[^\s\"'<>]*)?", re.IGNORECASE
+)
+
+
+def _embedded_video_url(page_html: str) -> str | None:
+    match = _EMBEDDED_VIDEO_PATTERN.search(html.unescape(page_html))
+    return match.group(0) if match else None
+
+
+def _download_http(
+    url: str,
+    destination: Path,
+    expected_size: int | None,
+    progress: Callable[[int, int | None], None] | None = None,
+) -> None:
+    """Download a direct file, or the video embedded in a Kverneland product page."""
+    with requests.get(url, stream=True, timeout=(15, 120)) as response:
+        response.raise_for_status()
+        if "text/html" not in response.headers.get("Content-Type", "").lower():
+            _stream_response(response, destination, expected_size, progress)
+            return
+        page_html = response.text
+    video_url = _embedded_video_url(page_html)
+    if video_url is None:
+        raise ValueError("The page contains no embedded video file.")
+    with requests.get(video_url, stream=True, timeout=(15, 120)) as response:
+        _stream_response(response, destination, expected_size, progress)
+
+
 def download_video(
     request: VideoRequest,
     directory: str | Path,
     graph: GraphClient | None,
     local_video_dir: str | Path | None = None,
+    progress: Callable[[int, int | None], None] | None = None,
 ) -> Path:
     parsed = urlsplit(request.video_url)
     name = request.video_name or Path(unquote(parsed.path)).name or "video.mp4"
@@ -502,11 +554,12 @@ def download_video(
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("Video source must be an HTTP(S) URL or an existing local file.")
     try:
-        with requests.get(request.video_url, stream=True, timeout=(15, 120)) as response:
-            _stream_response(response, destination, request.expected_size)
+        _download_http(request.video_url, destination, request.expected_size, progress)
         return destination
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as exc:
         destination.unlink(missing_ok=True)
+        if not _is_sharepoint_host(parsed.hostname):
+            raise RuntimeError(f"Could not download the video from {parsed.hostname}: {exc}") from exc
     if graph is None:
         raise RuntimeError(
             "Video download requires SharePoint sign-in. Set MS_GRAPH_CLIENT_ID and pass --site-url."
@@ -516,7 +569,7 @@ def download_video(
         destination = destination.with_name(f"row-{request.row_number}-{_safe_filename(graph_name)}")
     expected = request.expected_size or (graph_size or None)
     with requests.get(download_url, stream=True, timeout=(15, 120)) as response:
-        _stream_response(response, destination, expected)
+        _stream_response(response, destination, expected, progress)
     return destination
 
 
@@ -545,7 +598,12 @@ def authenticate_youtube(client_secrets: str | Path, token_file: str | Path):
     return build("youtube", "v3", credentials=credentials, cache_discovery=False)
 
 
-def upload_video(youtube, request: VideoRequest, path: str | Path) -> str:
+def upload_video(
+    youtube,
+    request: VideoRequest,
+    path: str | Path,
+    progress: Callable[[float], None] | None = None,
+) -> str:
     from googleapiclient.http import MediaFileUpload
 
     metadata = {
@@ -570,10 +628,34 @@ def upload_video(youtube, request: VideoRequest, path: str | Path) -> str:
     while response is None:
         status, response = call.next_chunk()
         if status:
+            if progress:
+                progress(status.progress())
             print(f"YouTube upload progress: {int(status.progress() * 100)}%")
     if not response.get("id"):
         raise RuntimeError("YouTube finished the upload without returning a video ID.")
     return response["id"]
+
+
+def resolve_thumbnail(request: VideoRequest, local_video_dir: str | Path | None) -> Path | None:
+    """Find and validate the thumbnail named in the workbook, or return None if none is requested."""
+    if not request.thumbnail_name:
+        return None
+    if not local_video_dir:
+        raise ValueError("A thumbnail is requested but no local video folder is configured.")
+    thumbnail_dir = Path(local_video_dir).expanduser().parent / "Thumbnail Image"
+    path = _find_local_video(thumbnail_dir, request.thumbnail_name)
+    if path.suffix.lower() not in THUMBNAIL_SUFFIXES:
+        raise ValueError(f"Thumbnail must be a JPG or PNG file: {path.name}")
+    if path.stat().st_size > THUMBNAIL_MAX_BYTES:
+        raise ValueError(f"Thumbnail is larger than 2 MB: {path.name}")
+    return path
+
+
+def set_thumbnail(youtube, video_id: str, path: Path) -> None:
+    from googleapiclient.http import MediaFileUpload
+
+    media = MediaFileUpload(str(path), mimetype="image/png" if path.suffix.lower() == ".png" else "image/jpeg")
+    youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
 
 
 def download_then_upload(
@@ -753,6 +835,13 @@ def _write_youtube_link(
         raise
 
 
+def _paste_instruction(row_number: int, link: str) -> str:
+    return (
+        f"The workbook is on SharePoint, so it was not modified. Paste this link into the "
+        f"YouTube Link column of row {row_number}: {link}"
+    )
+
+
 def _workbook_file(source: str, graph: GraphClient | None) -> tuple[Path, tempfile.TemporaryDirectory | None]:
     local = Path(source).expanduser()
     if local.is_file():
@@ -796,7 +885,15 @@ def _choose(requests_: list[VideoRequest], row: int | None) -> VideoRequest:
         print("Enter a row number from the pending list.")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    on_stage: Callable[[str, str, float | None], None] | None = None,
+) -> int:
+    def stage(name: str, detail: str = "", fraction: float | None = None) -> None:
+        if on_stage:
+            on_stage(name, detail, fraction)
+
+    stage("checking", "Reading the workbook")
     config_path = _config_path()
     config = _read_config(config_path)
     workbook_default = config.get("workbook", str(DEFAULT_WORKBOOK))
@@ -873,10 +970,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         prior = state.get(f"{source_hash}|{request.row_id}")
-        if isinstance(prior, dict) and prior.get("youtube_link") and temporary is None:
+        if isinstance(prior, dict) and prior.get("youtube_link"):
             link = str(prior["youtube_link"])
-            _write_youtube_link(Path(args.workbook), sheet, request.row_number, link)
-            print(f"Restored upload link in latest request row: {link}")
+            if temporary is None:
+                _write_youtube_link(Path(args.workbook), sheet, request.row_number, link)
+                print(f"Restored upload link in latest request row: {link}")
+            else:
+                print(_paste_instruction(request.row_number, link))
             return 0
     else:
         pending = [
@@ -888,17 +988,44 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         request = _choose(pending, args.row)
     print(f"\nSelected '{sheet}' row {request.row_number}: {request.title}")
+    thumbnail_path = resolve_thumbnail(request, args.local_video_dir)
+    if thumbnail_path:
+        print(f"Thumbnail verified: {thumbnail_path}")
+
+    def download_progress(written: int, total: int | None) -> None:
+        detail = f"{written / 1048576:,.0f} MB"
+        if total:
+            detail += f" of {total / 1048576:,.0f} MB"
+        stage("downloading", detail, written / total if total else None)
 
     def downloader(item: VideoRequest) -> Path:
-        return download_video(item, args.download_dir, graph, args.local_video_dir)
+        stage("downloading", "Starting download", 0.0)
+        return download_video(item, args.download_dir, graph, args.local_video_dir, download_progress)
+
+    def confirm_upload(prompt: str) -> str:
+        if args.yes:
+            return "y"
+        stage("confirm", "Verified. Waiting for your confirmation to upload as private")
+        return input(prompt)
 
     def uploader(item: VideoRequest, path: Path) -> str:
+        stage("uploading", "Uploading as private", 0.0)
         youtube = authenticate_youtube(args.client_secrets, args.youtube_token)
-        return upload_video(youtube, item, path)
+        video_id = upload_video(
+            youtube, item, path, progress=lambda fraction: stage("uploading", "Uploading as private", fraction)
+        )
+        if thumbnail_path:
+            stage("thumbnail", f"Setting thumbnail {thumbnail_path.name}")
+            try:
+                set_thumbnail(youtube, video_id, thumbnail_path)
+                print(f"Thumbnail set: {thumbnail_path.name}")
+            except Exception as exc:
+                print(f"Warning: the video uploaded, but the thumbnail could not be set: {exc}")
+        return video_id
 
-    confirm_upload = (lambda _prompt: "y") if args.yes else input
     video_id = download_then_upload(request, downloader, uploader, confirm_upload, args.dry_run)
     if not video_id:
+        stage("done", "Stopped before upload")
         return 0
     link = f"https://www.youtube.com/watch?v={video_id}"
     state[f"{source_hash}|{request.row_id}"] = {
@@ -907,6 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
         "title": request.title,
     }
     _write_state(state_path, state)
+    stage("saving", "Saving the link", None)
     if temporary is None:
         try:
             _write_youtube_link(Path(args.workbook), sheet, request.row_number, link)
@@ -916,12 +1044,13 @@ def main(argv: list[str] | None = None) -> int:
                 "the workbook. The saved link remains in the local upload state."
             ) from exc
     else:
-        print("The workbook is remote, so it was not modified.")
+        print(_paste_instruction(request.row_number, link))
     if request.playlist:
         print("Playlist insertion is not enabled; upload-only OAuth is used.")
     print(f"Upload complete: {link} (private)")
     if temporary is None:
         print("YouTube Link written to the workbook.")
+    stage("done", link, 1.0)
     return 0
 
 

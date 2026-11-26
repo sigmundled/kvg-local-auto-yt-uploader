@@ -35,12 +35,22 @@ STATUS_COLORS = {
     "busy": "#d97706",
     "error": "#dc2626",
 }
+DONE_COLOR = "#16a34a"
+# (stage name from auto_yt.main, step label shown in the status card)
+STAGE_STEPS = [
+    ("checking", "Check"),
+    ("downloading", "Download"),
+    ("uploading", "Upload"),
+    ("thumbnail", "Thumbnail"),
+    ("saving", "Link"),
+]
+# Stages without a step of their own map onto the step they belong to.
+STAGE_INDEX = {"checking": 0, "downloading": 1, "confirm": 1, "uploading": 2, "thumbnail": 3, "saving": 4, "done": 5}
 # (config key, label, browse kind, dialog title); kind is None for plain text fields.
 FIELD_SPECS = [
     ("workbook", "Request workbook (.xlsx)", "xlsx", "Select the request workbook"),
     ("local_video_dir", "Synced Video File folder", "dir", "Select the synced Video File folder"),
     ("client_secrets", "Google Desktop OAuth client JSON", "json", "Select the Google OAuth client JSON"),
-    ("update_manifest_url", "Update manifest URL (https, optional)", None, ""),
     ("check_interval_minutes", "Automatic check interval (minutes)", None, ""),
 ]
 FILE_TYPES = {
@@ -103,7 +113,6 @@ class SettingsDialog(ctk.CTkToplevel):
             "workbook": existing.get("workbook", str(auto_yt.DEFAULT_WORKBOOK)),
             "local_video_dir": existing.get("local_video_dir", str(auto_yt.DEFAULT_LOCAL_VIDEO_DIR)),
             "client_secrets": existing.get("client_secrets", str(auto_yt.APP_DIR / "client.json")),
-            "update_manifest_url": existing.get("update_manifest_url") or auto_yt.DEFAULT_UPDATE_MANIFEST_URL,
             "check_interval_minutes": existing.get(
                 "check_interval_minutes", str(DEFAULT_INTERVAL_MINUTES)
             ),
@@ -204,7 +213,6 @@ class SettingsDialog(ctk.CTkToplevel):
         workbook = Path(values["workbook"]).expanduser()
         video_dir = Path(values["local_video_dir"]).expanduser()
         client_secrets = Path(values["client_secrets"]).expanduser()
-        manifest = values["update_manifest_url"]
         interval_text = values["check_interval_minutes"]
 
         errors: list[str] = []
@@ -214,8 +222,6 @@ class SettingsDialog(ctk.CTkToplevel):
             errors.append("The Video File folder was not found.")
         if not _is_desktop_oauth_file(client_secrets):
             errors.append("The Google OAuth file must be a Desktop application client JSON.")
-        if manifest and not manifest.lower().startswith("https://"):
-            errors.append("The update manifest URL must start with https://.")
         if not interval_text.isdigit() or int(interval_text) < MIN_INTERVAL_MINUTES:
             errors.append(f"The check interval must be a whole number of minutes, at least {MIN_INTERVAL_MINUTES}.")
         if errors:
@@ -228,8 +234,6 @@ class SettingsDialog(ctk.CTkToplevel):
             "client_secrets": str(client_secrets.resolve()),
             "check_interval_minutes": str(int(interval_text)),
         }
-        if manifest:
-            config["update_manifest_url"] = manifest
         try:
             auto_yt._save_config(auto_yt._config_path(), config)
         except OSError as exc:
@@ -386,6 +390,13 @@ class AutoYouTubeApp:
         status = self._card(cards, 0, "STATUS", padx=(0, 8))
         self.status_text = ctk.CTkLabel(status, text="Starting…", font=_font(20, "bold"), anchor="w")
         self.status_text.pack(fill="x", padx=20, pady=(4, 2))
+        steps = ctk.CTkFrame(status, fg_color="transparent")
+        steps.pack(fill="x", padx=20, pady=(4, 6))
+        self.step_labels: list[ctk.CTkLabel] = []
+        for _, label in STAGE_STEPS:
+            step = ctk.CTkLabel(steps, text=label, font=_font(11, "bold"), text_color=MUTED)
+            step.pack(side="left", padx=(0, 10))
+            self.step_labels.append(step)
         self.last_check_label = ctk.CTkLabel(
             status, text="Last check: never", font=_font(13), text_color=MUTED, anchor="w"
         )
@@ -502,10 +513,38 @@ class AutoYouTubeApp:
 
     # Checks and updates
 
+    def _reset_steps(self) -> None:
+        self.current_stage = "checking"
+        for step in self.step_labels:
+            step.configure(text_color=MUTED)
+        for (_, label), step in zip(STAGE_STEPS, self.step_labels):
+            step.configure(text=label)
+
+    def _show_stage(self, name: str, detail: str, fraction: float | None) -> None:
+        self.current_stage = name
+        index = STAGE_INDEX.get(name, 0)
+        for position, ((_, label), step) in enumerate(zip(STAGE_STEPS, self.step_labels)):
+            if position < index:
+                step.configure(text=f"✓ {label}", text_color=DONE_COLOR)
+            elif position == index and name != "done":
+                step.configure(text=f"● {label}", text_color=ACCENT)
+            else:
+                step.configure(text=label, text_color=MUTED)
+        if name != "done" and detail:
+            self.status_text.configure(text=detail)
+        if fraction is None:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start()
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress.set(fraction)
+
     def check_now(self) -> None:
         if self.busy:
             return
         self.busy = True
+        self._reset_steps()
         self._set_status("busy", "Checking…")
         self.check_button.configure(state="disabled", text="Checking…")
         self.progress.configure(mode="indeterminate")
@@ -513,12 +552,15 @@ class AutoYouTubeApp:
         self._log("Checking the workbook for new requests…")
         threading.Thread(target=self._run_check, daemon=True).start()
 
+    def _queue_stage(self, name: str, detail: str, fraction: float | None) -> None:
+        self.events.put(("stage", (name, detail, fraction)))
+
     def _run_check(self) -> None:
         output = io.StringIO()
         result: dict[str, object] = {"ok": True, "uploaded": False, "error": ""}
         try:
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                auto_yt.main(["--yes"])
+                auto_yt.main(["--yes"], on_stage=self._queue_stage)
             result["uploaded"] = "Upload complete" in output.getvalue()
         except Exception as exc:
             result = {"ok": False, "uploaded": False, "error": str(exc)}
@@ -538,12 +580,7 @@ class AutoYouTubeApp:
 
     def _run_update_check(self) -> None:
         try:
-            config = auto_yt._read_config(auto_yt._config_path())
-            manifest = config.get("update_manifest_url") or auto_yt.DEFAULT_UPDATE_MANIFEST_URL
-            if not manifest:
-                self.events.put(("update", (None, "Updates are not configured")))
-                return
-            update = check_update(manifest, auto_yt.APP_VERSION)
+            update = check_update(auto_yt.DEFAULT_UPDATE_MANIFEST_URL, auto_yt.APP_VERSION)
             if update:
                 note = f"Installed {auto_yt.APP_VERSION} · version {update['version']} available"
             else:
@@ -583,7 +620,8 @@ class AutoYouTubeApp:
         self.next_check_at = time.time() + self.interval_minutes * 60
         self._refresh_uploads()
         if not result["ok"]:
-            self._set_status("error", "Check failed")
+            failed_step = dict(STAGE_STEPS).get(self.current_stage, "start")
+            self._set_status("error", f"Failed at {failed_step.lower()} step")
         elif result["uploaded"]:
             self._set_status("ready", "Uploaded")
         else:
@@ -721,6 +759,8 @@ class AutoYouTubeApp:
                 self._log(str(value))
             elif kind == "update":
                 self._apply_update(value)  # type: ignore[arg-type]
+            elif kind == "stage":
+                self._show_stage(*value)  # type: ignore[misc]
             elif kind == "done":
                 self._finish_check(value)  # type: ignore[arg-type]
             elif kind == "install_failed":

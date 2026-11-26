@@ -2,6 +2,22 @@
 
 All notable changes to Auto YouTube Uploader are listed here, newest first.
 
+## 1.4.0
+
+- Downloads: column M links to Cloudinary files and to `download.kvernelandgroup.com` pages
+  are supported. Kverneland pages are resolved to their embedded Cloudinary MP4, so files over
+  1 GB can be used. Other download failures are reported directly and no longer fall back to
+  SharePoint.
+- Thumbnails: an image named in the thumbnail column (column N, or the "Thumbnail" header) is
+  read from the `Thumbnail Image` folder beside `Video File` and set on the uploaded video.
+  Images must be JPG or PNG and at most 2 MB. A thumbnail failure is reported as a warning and
+  does not fail the upload.
+- Workbook sync: for a remote (SharePoint) workbook, the client does not write the link back.
+  It shows the row and link to paste manually, and it never uploads the same row twice.
+- Client: the window shows the current step (Check, Download, Upload, Thumbnail, Link) and a
+  progress bar, and reports which step failed.
+- The update manifest URL is no longer shown in settings and cannot be changed.
+
 ## 1.3.0
 
 - Client is now packaged as a folder (`AutoYouTubeUploader\` with `AutoYouTubeUploader.exe`

@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
 
@@ -22,6 +22,8 @@ from auto_yt import (
     download_then_upload,
     load_requests,
     main,
+    resolve_thumbnail,
+    set_thumbnail,
     verify_download,
 )
 
@@ -125,6 +127,51 @@ class WorkbookTests(unittest.TestCase):
         )
 
 
+class ThumbnailTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.video_dir = self.root / "Video File"
+        self.thumb_dir = self.root / "Thumbnail Image"
+        self.video_dir.mkdir()
+        self.thumb_dir.mkdir()
+        self.request = VideoRequest(
+            6, "6", "Plough", "", [], "", "", "https://example.test/v.mp4", "v.mp4", None, "",
+            thumbnail_name="thumb.jpg",
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_thumbnail_is_found_in_sibling_folder(self):
+        thumb = self.thumb_dir / "thumb.jpg"
+        thumb.write_bytes(b"\xff\xd8\xff" + b"x" * 10)
+        self.assertEqual(resolve_thumbnail(self.request, self.video_dir), thumb)
+
+    def test_oversized_thumbnail_is_rejected(self):
+        (self.thumb_dir / "thumb.jpg").write_bytes(b"0" * (2 * 1024 * 1024 + 1))
+        with self.assertRaisesRegex(ValueError, "larger than 2 MB"):
+            resolve_thumbnail(self.request, self.video_dir)
+
+    def test_missing_thumbnail_fails_before_upload(self):
+        with self.assertRaises(FileNotFoundError):
+            resolve_thumbnail(self.request, self.video_dir)
+
+    def test_set_thumbnail_calls_youtube_api_with_video_id(self):
+        path = self.thumb_dir / "thumb.png"
+        path.write_bytes(b"\x89PNG" + b"x" * 10)
+        youtube = Mock()
+        set_thumbnail(youtube, "vid123", path)
+        self.assertEqual(youtube.thumbnails.return_value.set.call_args.kwargs["videoId"], "vid123")
+
+    def test_column_n_is_used_when_no_thumbnail_header(self):
+        headers = ["Id", "Title", "Video"] + [None] * 10 + ["Extra"]
+        values = {"Id": 1, "Title": "T", "Video": "https://example.test/v.mp4", "Extra": "thumb.jpg"}
+        request = _make_request(headers, values, {}, 2)
+        self.assertEqual(request.thumbnail_name, "thumb.jpg")
+
+
 class DownloadGateTests(unittest.TestCase):
     def setUp(self):
         self.request = VideoRequest(
@@ -216,6 +263,56 @@ class DownloadGateTests(unittest.TestCase):
                 source.read_bytes(),
             )
             self.assertIn("Verified download:", output.getvalue())
+
+    def _http_response(self, content_type, body=b"", text=""):
+        response = MagicMock()
+        response.headers = {"Content-Type": content_type}
+        response.text = text
+        response.iter_content.return_value = [body]
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return response
+
+    def test_kverneland_page_resolves_to_embedded_cloudinary_video(self):
+        mp4 = b"\x00\x00\x00\x18ftypisom" + b"x" * 24
+        page = self._http_response(
+            "text/html; charset=utf-8",
+            text='<video src="https://res.cloudinary.com/kvg/video/upload/a.mp4?x=1&amp;y=2"></video>',
+        )
+        video = self._http_response("video/mp4", body=mp4)
+        graph = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("auto_yt.requests.get", side_effect=[page, video]) as get:
+                request = VideoRequest(
+                    3, "3", "Plough", "", [], "", "", "https://download.kvernelandgroup.com/x", "", None, "",
+                )
+                result = download_video(request, directory, graph)
+                self.assertEqual(result.read_bytes(), mp4)
+        self.assertEqual(get.call_args_list[1].args[0], "https://res.cloudinary.com/kvg/video/upload/a.mp4?x=1&y=2")
+        graph.download_url.assert_not_called()
+
+    def test_landing_page_without_video_fails_clearly_without_graph(self):
+        page = self._http_response("text/html", text="<html>no video here</html>")
+        graph = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("auto_yt.requests.get", return_value=page):
+                request = VideoRequest(
+                    4, "4", "Plough", "", [], "", "", "https://download.kvernelandgroup.com/x", "", None, "",
+                )
+                with self.assertRaisesRegex(RuntimeError, "no embedded video"):
+                    download_video(request, directory, graph)
+        graph.download_url.assert_not_called()
+
+    def test_non_sharepoint_http_failure_does_not_fall_back_to_graph(self):
+        graph = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("auto_yt.requests.get", side_effect=requests.ConnectionError("down")):
+                request = VideoRequest(
+                    5, "5", "Plough", "", [], "", "", "https://example.test/video.mp4", "", None, "",
+                )
+                with self.assertRaisesRegex(RuntimeError, "Could not download"):
+                    download_video(request, directory, graph)
+        graph.download_url.assert_not_called()
 
     def test_no_row_argument_uses_latest_request_and_does_not_upload_older_rows(self):
         from openpyxl import Workbook

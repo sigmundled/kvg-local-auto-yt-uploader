@@ -140,7 +140,7 @@ these variables the build is unsigned, which is the current setup.
 
 The default update manifest is
 `https://github.com/sigmundled/kvg-local-auto-yt-uploader/releases/latest/download/latest.json`.
-It is used unless `update_manifest_url` is set in `config.json` or the setup form.
+It is built into the client and is not configurable in the window.
 The client checks that manifest during each hourly cycle and shows an update notice with an
 `Update` button. Updates are accepted only over HTTPS, require a matching 64-character
 SHA-256 hash, and are verified before the application folder is replaced. The update
