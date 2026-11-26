@@ -2,10 +2,21 @@
 
 All notable changes to Auto YouTube Uploader are listed here, newest first.
 
+## 1.4.2 - 2026-11-26
+
+- The main client page and activity log are scrollable, and new activity stays visible at the bottom.
+- Status now shows "Up to date" or "Update available". The status control opens client-update and
+  latest-features options, and an available update reveals its release notes and download/install actions.
+- Added a countdown progress bar, moved the requested-video check and automatic-check control into
+  the Status card, and added version/date headings with bullet lists to the latest features.
+- Added a YouTube Studio button that opens the matching video's edit page. YouTube buttons wrap
+  onto another row when the window is too narrow.
+- Simplified the client actions, removed the Quit button and settings-path label, tightened card
+  spacing, and added app/platform/Python debug information.
+
 ## 1.4.1
 
-- The client window can be resized, the activity display no longer scrolls, and status
-  progress appears only while a check or update is active.
+- The client window can be resized, and status progress appears only while a check or update is active.
 - Update downloads now show progress and remain separate from installation. Download,
   install, and download-and-install actions are available; an interrupted console install
   is reported when the client restarts.

@@ -110,7 +110,11 @@ inside that folder. The EXE performs a first-run setup:
 When open, the client checks for the latest blank-`YouTube Link` request immediately
 and then every hour. It verifies the matching local video, uploads it as private, and
 writes the resulting URL into the workbook. The window provides active-stage progress,
-an expandable latest-features panel, `Check now`, `Settings`, and `Quit` controls.
+an `Up to date`/`Update available` status menu, a scrollable activity log, an automatic-check
+countdown, and a requested-video check in the Status card. The status menu opens client-update
+and latest-features options; available releases expose their notes and download/install actions.
+The YouTube actions include opening the latest upload in YouTube Studio or on YouTube, and
+copying its URL.
 Minimizing the window places it in the Windows system tray; the tray icon can restore
 or exit the client. A Windows notification appears after each completed upload.
 The YouTube action uses the play-mark from the official

@@ -23,7 +23,7 @@ import requests
 GRAPH_SCOPES = ["Files.Read.All", "Sites.Read.All"]
 YOUTUBE_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 MP4_SIGNATURE = b"ftyp"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 DEFAULT_UPDATE_MANIFEST_URL = (
     "https://github.com/sigmundled/kvg-local-auto-yt-uploader/releases/latest/download/latest.json"
 )
